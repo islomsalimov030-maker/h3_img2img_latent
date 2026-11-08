@@ -16,6 +16,7 @@ import torch.nn.functional as F
 import comfy.samplers
 import comfy.nested_tensor
 
+__version__ = "0.2.0"
 DENSE = 1000
 
 
@@ -33,7 +34,10 @@ class H3LatentFromImage:
                 "scheduler": (comfy.samplers.SCHEDULER_NAMES, {"default": "simple"}),
                 "denoise": ("FLOAT", {"default": 0.35, "min": 0.01, "max": 1.0, "step": 0.01,
                                       "tooltip": "Noise fraction mixed into the source. 0.2 subtle, 0.35 face fix, 0.6+ strong."}),
-            }
+                "always_encode": ("BOOLEAN", {"default": False,
+                    "tooltip": "Encode init into target video even at denoise=1. References stay in conditioning."}),
+            },
+            "optional": {"mask": ("MASK",)},
         }
 
     RETURN_TYPES = ("LATENT", "SIGMAS", "STRING")
@@ -53,10 +57,13 @@ class H3LatentFromImage:
         sig[-1] = 0.0
         return sig
 
-    def run(self, h3_latent, vae, image, model, steps, scheduler, denoise):
+    def run(self, h3_latent, vae, image, model, steps, scheduler, denoise,
+            always_encode=False, mask=None):
         sigmas = self._schedule(model, scheduler, steps, denoise)
         out = dict(h3_latent)
-        if denoise >= 0.999:
+        if denoise >= 0.999 and not always_encode:
+            if mask is not None:
+                out["noise_mask"] = self._mask(h3_latent["samples"], mask)
             return (out, sigmas, f"denoise 1.0 -> full generation from noise ({len(sigmas)-1} steps)")
 
         samples = h3_latent["samples"]
@@ -82,7 +89,38 @@ class H3LatentFromImage:
         info = (f"denoise {denoise:.2f}: {len(sigmas)-1} steps, sigmas "
                 + ", ".join(f"{float(s):.3f}" for s in sigmas)
                 + f" | latent {tuple(enc.shape)}")
+        if mask is not None:
+            out["noise_mask"] = self._mask(out["samples"], mask)
+        if always_encode:
+            shapes = [tuple(x.shape) for x in out["samples"].tensors] if nested else [tuple(enc.shape)]
+            mask_shapes = ([tuple(x.shape) for x in out["noise_mask"].tensors]
+                           if mask is not None and nested else
+                           tuple(out["noise_mask"].shape) if mask is not None else None)
+            # Core 0.34.6/current: references are minimax_refs in CONDITIONING,
+            # never temporal slots in samples. All video slots are targets.
+            info += (f" | version {__version__}; samples={shapes}; target_frames={list(range(t))}; "
+                     f"reference_frames=[] (conditioning minimax_refs, not samples); "
+                     f"cell_px={1344 / w:g}; noise_mask={mask_shapes}")
         return (out, sigmas, info)
+
+    @staticmethod
+    def _mask(samples, mask):
+        nested = hasattr(samples, "tensors")
+        streams = samples.tensors if nested else [samples]
+        video = streams[0]
+        if video.ndim != 5:
+            raise ValueError("Expected H3 target video [B,C,T,H,W]; unknown layout, stop")
+        b, c, t, h, w = video.shape
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0)
+        if mask.ndim != 3 or mask.shape[0] not in (1, b):
+            raise ValueError("mask must be [H,W] or [1|B,H,W]")
+        spatial = F.interpolate(mask[:, None].float(), size=(h, w), mode="area")
+        spatial = spatial.to(device=video.device, dtype=video.dtype).clamp(0, 1)
+        video_mask = spatial[:, :, None].expand(b, c, t, h, w).clone()
+        if nested:
+            return comfy.nested_tensor.NestedTensor([video_mask] + [torch.zeros_like(x) for x in streams[1:]])
+        return video_mask
 
 
 NODE_CLASS_MAPPINGS = {"H3LatentFromImage": H3LatentFromImage}
